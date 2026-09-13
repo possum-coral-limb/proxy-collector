@@ -1,0 +1,17 @@
+name = "proxy-collector"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# KV 命名空间：先 `wrangler kv namespace create PROXY_KV` 后把返回的 id 填入
+[[kv_namespaces]]
+binding = "PROXY_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# 每天北京时间 03:00 清理 7 天前的代理
+[triggers]
+crons = ["0 19 * * *"]  # UTC 19:00 = 北京 03:00
+
+# Secrets（wrangler secret put 上传，不要写在这里）：
+#   UPLOAD_TOKEN     上传认证 token（curl -H "Authorization: Bearer <token>"）
+#   ADMIN_PASSWORD   管理面板登录密码
+#   SUB_SIGN         （可选）订阅签名
