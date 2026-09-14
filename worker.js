@@ -338,6 +338,20 @@ async function purgeExpired(kv) {
   return removed;
 }
 
+async function listSubs(env) {
+  const subs = [];
+  let cursor;
+  do {
+    const page = await env.PROXY_KV.list({ prefix: "sub:", cursor });
+    for (const k of page.keys) {
+      const raw = await env.PROXY_KV.get(k.name);
+      if (raw) subs.push(JSON.parse(raw));
+    }
+    cursor = page.list_complete ? undefined : page.list_cursor;
+  } while (cursor);
+  return subs;
+}
+
 // ---------------------------------------------------------------------------
 // Clash YAML 转换（尽力而为：解析失败的跳过）
 // ---------------------------------------------------------------------------
@@ -527,23 +541,18 @@ export default {
         if (!authorized) return jsonResp({ error: "unauthorized" }, 401);
         const proxies = await listProxies(env.PROXY_KV);
         proxies.sort((a, b) => b.added_at - a.added_at);
-        return jsonResp({ count: proxies.length, proxies });
+        // 面板一次取回代理 + 订阅（load() 读 pr.subs）
+        return jsonResp({
+          count: proxies.length,
+          proxies,
+          subs: await listSubs(env),
+        });
       }
       if (path === "/api/proxies/purge" && method === "POST") {
         return jsonResp({ removed: await purgeExpired(env.PROXY_KV) });
       }
       if (path === "/api/subs" && method === "GET") {
-        const subs = [];
-        let cursor;
-        do {
-          const page = await env.PROXY_KV.list({ prefix: "sub:", cursor });
-          for (const k of page.keys) {
-            const raw = await env.PROXY_KV.get(k.name);
-            if (raw) subs.push(JSON.parse(raw));
-          }
-          cursor = page.list_complete ? undefined : page.list_cursor;
-        } while (cursor);
-        return jsonResp({ subs });
+        return jsonResp({ subs: await listSubs(env) });
       }
       if (path === "/api/subs" && method === "POST") {
         const { name, expires_days } = await request.json();
@@ -662,8 +671,9 @@ function renderPanel(){app.innerHTML='<h1>ProxyCollector <button class=ghost sty
  +'<div class=card><b>创建订阅</b><div class=row style=margin-top:10px><input id=sname placeholder=订阅名 style=flex:2><input id=sdays type=number placeholder=有效期(天,空=永久) style=flex:1><button onclick=createSub()>创建</button></div><div class=dim style=margin-top:6px>订阅按 User-Agent 自动适配 Clash YAML / base64 URI（v2rayN、sing-box 等）</div></div>'
  +'<div class=card><div class=row><b>订阅列表</b><button class=ghost style=margin-left:auto onclick=load()>刷新</button></div><table style=margin-top:10px><thead><tr><th>名称</th><th>链接</th><th>有效期</th><th>状态</th><th>操作</th></tr></thead><tbody id=subs></tbody></table></div>'
  +'<div class=card><div class=row><b>代理池</b><span class=dim style=margin-left:auto id=stat></span><button class=red onclick=purge()>清理过期</button></div><div id=proxies class=mono style=margin-top:10px;max-height:300px;overflow:auto></div></div>'}
-async function load(){try{const[st,pr]=await Promise.all([api('/api/stats'),api('/api/proxies')]);
- $('#stat').textContent='代理 '+st.proxy_count+' 条'+(st.oldest?' · 最早 '+st.oldest.slice(0,10):'');
+async function load(){try{const pr=await api('/api/proxies');
+ const _oldest=pr.proxies.reduce((m,p)=>p.added_at&&(!m||p.added_at<m)?p.added_at:m,0);
+ $('#stat').textContent='代理 '+pr.count+' 条'+(_oldest?' · 最早 '+new Date(_oldest).toISOString().slice(0,10):'');
  $('#subs').innerHTML=pr.subs.map(s=>'<tr><td>'+esc(s.name)+'</td>'
   +'<td class=mono><a href="/sub/'+s.id+'?key='+esc(s.key)+'" target=_blank style=color:var(--blue)>/sub/'+esc(s.id.slice(0,8))+'…</a> '
   +'<button class=ghost style="padding:2px 6px;font-size:10px" onclick="copySub(\\\''+esc(s.id)+'\\\',\\\''+esc(s.key)+'\\\')">复制</button></td>'
@@ -695,5 +705,5 @@ async function createSub(){try{const d=await api('/api/subs',{method:'POST',body
 async function toggle(id,en){try{await api('/api/subs/'+id+'/update',{method:'POST',body:JSON.stringify({enabled:en})});load()}catch(e){toast('失败: '+e)}}
 async function del(id){if(!confirm('删除该订阅？'))return;try{await api('/api/subs/'+id+'/delete',{method:'POST'});load()}catch(e){toast('失败: '+e)}}
 async function purge(){try{const d=await api('/api/proxies/purge',{method:'POST'});toast('已清理 '+d.removed+' 条过期代理');load()}catch(e){toast('失败: '+e)}}
-(async()=>{try{await api('/api/stats');renderPanel();load()}catch(e){if(e!==0)renderLogin()}})();
+(async()=>{try{await api('/api/subs');renderPanel();load()}catch(e){if(e!==0)renderLogin()}})();
 </script></body></html>`;
