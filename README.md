@@ -2,7 +2,7 @@
 
 单文件 Worker：收集各类代理，按客户端类型自动适配订阅格式下发，支持每条代理独立过期时间（7 天试用代理专用路径 + 自由 TTL），内置管理面板与前端提交。
 
-支持协议：`http` / `https` / `socks5` / `vmess://` / `vless://` / `ss://` / `trojan://` / sing-box JSON outbounds
+支持协议：`http` / `https` / `socks5` / `vmess://` / `vless://` / `ss://` / `trojan://` / `tuic://` / `hy2://`（hysteria2）/ `anytls://` / sing-box JSON·YAML outbounds / Clash YAML proxies
 
 ## 部署（5 分钟）
 
@@ -56,10 +56,17 @@ Content-Type: text/plain（每行一条）或 application/json（{"proxies":[...
 http://user:pass@host:port        socks5://user:pass@host:port
 vmess://BASE64JSON                vless://uuid@host:port?params#name
 ss://BASE64(method:pass@host:port)#name     trojan://pass@host:port#name
+tuic://uuid:pass@host:port?params#name      hy2://pass@host:port?params#name（= hysteria2://）
+anytls://pass@host:port?params#name
 host:port:user:pass               user:pass@host:port
 host:port
-{"outbounds":[...]}               （sing-box，Content-Type: application/json）
+{"outbounds":[...]}               （sing-box JSON，Content-Type: application/json）
+Clash YAML 整段                   （含 proxies: 列表即可，YAML 直接粘贴文本上传）
+sing-box YAML 整段                （含 outbounds: 列表即可）
 ```
+
+> Clash/sing-box YAML 由内置的极简 YAML 解析器处理（块式 + 流式条目），
+> 不支持的锚点等高级语法只会跳过对应条目，不影响其余解析。
 
 响应：`{"added": 新增数, "refreshed": 续期数, "expires_at": "..."}`
 重复上传同一行会刷新/延长其过期时间（活跃代理不被清理）。

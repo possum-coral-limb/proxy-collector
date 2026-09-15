@@ -1,7 +1,7 @@
 name: Lint
 on:
   push:
-    paths: ["worker.js"]
+    paths: ["worker.js", "tests/**", ".github/workflows/lint.yml"]
 jobs:
   syntax:
     runs-on: ubuntu-latest
@@ -13,3 +13,11 @@ jobs:
           cp worker.js /tmp/worker.mjs
           node --check /tmp/worker.mjs
           echo "worker.js 语法 OK"
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: node tests/worker_test.mjs
+      - run: node tests/panel_boot_test.mjs

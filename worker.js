@@ -159,7 +159,55 @@ export function parseProxyLine(line) {
       const u = new URL(line);
       rec.host = u.hostname;
       rec.port = parseInt(u.port, 10);
-      rec.trojan = { password: decodeURIComponent(u.username) };
+      rec.trojan = {
+        password: decodeURIComponent(u.username),
+        params: Object.fromEntries(u.searchParams),
+      };
+      rec.name = decodeURIComponent(u.hash.slice(1)) || u.hostname;
+    } catch {}
+    return rec.host && rec.port ? rec : null;
+  }
+
+  // ---- tuic / hysteria2(hy2) / anytls URI ----
+  if (line.startsWith("tuic://")) {
+    rec.proto = "tuic";
+    try {
+      const u = new URL(line);
+      rec.host = u.hostname;
+      rec.port = parseInt(u.port, 10);
+      rec.tuic = {
+        uuid: decodeURIComponent(u.username),
+        password: u.password ? decodeURIComponent(u.password) : "",
+        params: Object.fromEntries(u.searchParams),
+      };
+      rec.name = decodeURIComponent(u.hash.slice(1)) || u.hostname;
+    } catch {}
+    return rec.host && rec.port ? rec : null;
+  }
+  if (line.startsWith("hysteria2://") || line.startsWith("hy2://")) {
+    rec.proto = "hysteria2";
+    try {
+      const u = new URL(line);
+      rec.host = u.hostname;
+      rec.port = parseInt(u.port, 10);
+      rec.hy2 = {
+        password: decodeURIComponent(u.username) + (u.password ? ":" + decodeURIComponent(u.password) : ""),
+        params: Object.fromEntries(u.searchParams),
+      };
+      rec.name = decodeURIComponent(u.hash.slice(1)) || u.hostname;
+    } catch {}
+    return rec.host && rec.port ? rec : null;
+  }
+  if (line.startsWith("anytls://")) {
+    rec.proto = "anytls";
+    try {
+      const u = new URL(line);
+      rec.host = u.hostname;
+      rec.port = parseInt(u.port, 10);
+      rec.anytls = {
+        password: decodeURIComponent(u.username) + (u.password ? ":" + decodeURIComponent(u.password) : ""),
+        params: Object.fromEntries(u.searchParams),
+      };
       rec.name = decodeURIComponent(u.hash.slice(1)) || u.hostname;
     } catch {}
     return rec.host && rec.port ? rec : null;
@@ -231,6 +279,328 @@ export function parseSingBox(body) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 极简 YAML 子集解析（只为提取 proxies:/outbounds: 下的 map 列表）：
+//   - 块式条目 `- key: v` + 缩进续行（含一层层嵌套 map，如 ws-opts:）
+//   - 流式条目 `- {k: v, k2: [a, b]}`
+//   锚点/多行字符串等高级语法不支持——单条解析失败则该条跳过，不影响其余。
+// ---------------------------------------------------------------------------
+function yamlScalar(v) {
+  v = v.trim().replace(/\s+#.*$/, "").trim();
+  if (!v) return "";
+  if ((v.startsWith("{") && v.endsWith("}")) || (v.startsWith("[") && v.endsWith("]")))
+    return yamlFlow(v);
+  if ((v.startsWith('"') && v.endsWith('"') && v.length > 1) ||
+      (v.startsWith("'") && v.endsWith("'") && v.length > 1))
+    return v.slice(1, -1).replace(/''/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  if (/^-?\d+$/.test(v)) return parseInt(v, 10);
+  if (/^-?\d*\.\d+$/.test(v)) return parseFloat(v);
+  if (/^(true|yes)$/i.test(v)) return true;
+  if (/^(false|no)$/i.test(v)) return false;
+  if (/^(null|~)$/i.test(v)) return null;
+  return v;
+}
+
+/** 按逗号切分流式集合内容，忽略引号与嵌套 {}[] 内的逗号 */
+function splitFlow(s) {
+  const out = [];
+  let depth = 0, q = null, cur = "";
+  for (const ch of s) {
+    if (q) { cur += ch; if (ch === q) q = null; continue; }
+    if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+    if (ch === "{" || ch === "[") { depth++; cur += ch; continue; }
+    if (ch === "}" || ch === "]") { depth--; cur += ch; continue; }
+    if (ch === "," && depth === 0) { out.push(cur.trim()); cur = ""; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+function yamlFlow(s) {
+  s = s.trim();
+  if (s.startsWith("[")) {
+    const inner = s.slice(1, -1).trim();
+    return inner ? splitFlow(inner).map((x) => yamlScalar(x)) : [];
+  }
+  if (s.startsWith("{")) {
+    const inner = s.slice(1, -1).trim();
+    const obj = {};
+    if (!inner) return obj;
+    for (const part of splitFlow(inner)) {
+      const m = part.match(/^([^:]+):\s*([\s\S]*)$/);
+      if (m) obj[m[1].trim().replace(/^["']|["']$/g, "")] = yamlScalar(m[2]);
+    }
+    return obj;
+  }
+  return s;
+}
+
+function parseYamlMapList(body, listKey) {
+  const lines = body.split(/\r?\n/);
+  let base = -1, i = 0;
+  for (; i < lines.length; i++) {
+    const m = lines[i].match(/^(\s*)["']?(proxies|outbounds)["']?\s*:\s*(|#.*)$/);
+    if (m && m[2] === listKey) { base = m[1].length; i++; break; }
+  }
+  if (base < 0) return null;
+  const items = [];
+  let cur = null;
+  const stack = []; // 嵌套 map 栈：[{indent, obj}]，stack[0] 是条目本体
+  for (; i < lines.length; i++) {
+    const line = lines[i].replace(/\t/g, "  ");
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent <= base) break; // 回到顶层（如 proxy-groups:）→ 列表结束
+    if (trimmed.startsWith("- ") || trimmed === "-") {
+      cur = {};
+      items.push(cur);
+      stack.length = 0;
+      stack.push({ indent, obj: cur });
+      const rest = trimmed === "-" ? "" : trimmed.slice(2).trim();
+      if (rest.startsWith("{")) {
+        Object.assign(cur, yamlFlow(rest));
+        cur = null; // 流式条目一行结束
+        stack.length = 0;
+      } else if (rest) {
+        const mm = rest.match(/^([^:]+):\s*([\s\S]*)$/);
+        if (mm) cur[mm[1].trim().replace(/^["']|["']$/g, "")] = yamlScalar(mm[2]);
+      }
+      continue;
+    }
+    if (!cur) continue;
+    const kv = trimmed.match(/^([^:]+):\s*([\s\S]*)$/);
+    if (!kv) continue;
+    const key = kv[1].trim().replace(/^["']|["']$/g, "");
+    const val = kv[2];
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const parent = stack[stack.length - 1].obj;
+    if (val.trim() === "" || val.trim().startsWith("#")) {
+      parent[key] = {}; // 嵌套 map 开启（后续更深缩进归它）
+      stack.push({ indent, obj: parent[key] });
+    } else {
+      parent[key] = yamlScalar(val);
+    }
+  }
+  return items.length ? items : null;
+}
+
+/** 查询参数序列化（跳过空值） */
+function qsBuild(obj) {
+  return Object.entries(obj)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join("&");
+}
+
+/** Clash 代理条目 → 标准 URI（不支持的类型返回 null） */
+export function clashToUri(p) {
+  const name = p.name || p.tag || "";
+  const frag = name ? "#" + encodeURIComponent(name) : "";
+  const host = String(p.server || "").replace(/[\[\]]/g, "");
+  const port = p.port ?? p.server_port;
+  if (!host || !port) return null;
+  const wsOpts = p["ws-opts"] || {};
+  switch (p.type) {
+    case "ss": {
+      if (!p.cipher || !p.password) return null;
+      return `ss://${b64encode(`${p.cipher}:${p.password}`)}@${host}:${port}${frag}`;
+    }
+    case "vmess": {
+      const j = {
+        v: "2", ps: name, add: host, port: String(port), id: p.uuid,
+        aid: String(p.alterId ?? p["alter-id"] ?? 0), scy: p.cipher || "auto",
+        net: p.network || "tcp", type: p["header-type"] || "none",
+        host: wsOpts.headers?.Host || p["http-opts"]?.host?.[0] || "",
+        path: wsOpts.path || p["h2-opts"]?.path?.[0] || "",
+        tls: p.tls ? "tls" : "", sni: p.servername || p.sni || "",
+      };
+      return `vmess://${b64encode(JSON.stringify(j))}`;
+    }
+    case "vless": {
+      const params = {};
+      if (p["reality-opts"]) params.security = "reality";
+      else if (p.tls) params.security = "tls";
+      const sni = p.servername || p.sni;
+      if (sni) params.sni = sni;
+      if (p.flow) params.flow = p.flow;
+      if (p.network && p.network !== "tcp") params.type = p.network;
+      if (p.network === "ws" && wsOpts.path) {
+        params.path = wsOpts.path;
+        if (wsOpts.headers?.Host) params.host = wsOpts.headers.Host;
+      }
+      if (p["reality-opts"]?.["public-key"]) params.pbk = p["reality-opts"]["public-key"];
+      if (p["reality-opts"]?.["short-id"]) params.sid = p["reality-opts"]["short-id"];
+      if (p["client-fingerprint"]) params.fp = p["client-fingerprint"];
+      const qs = qsBuild(params);
+      return `vless://${p.uuid}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "trojan": {
+      const params = {};
+      const sni = p.sni || p.servername;
+      if (sni) params.sni = sni;
+      if (p["skip-cert-verify"]) params.allowInsecure = 1;
+      if (p.network && p.network !== "tcp") {
+        params.type = p.network;
+        if (p.network === "ws" && wsOpts.path) params.path = wsOpts.path;
+      }
+      const qs = qsBuild(params);
+      return `trojan://${encodeURIComponent(p.password || "")}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "http": case "https": case "socks5": case "socks5h": {
+      const auth = p.username
+        ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || "")}@`
+        : "";
+      return `${p.type}://${auth}${host}:${port}${frag}`;
+    }
+    case "tuic": {
+      if (!p.uuid || !p.password) return null;
+      const params = {};
+      const sni = p.sni || p.servername;
+      if (sni) params.sni = sni;
+      if (p["congestion-controller"]) params.congestion_control = p["congestion-controller"];
+      if (p.alpn) params.alpn = Array.isArray(p.alpn) ? p.alpn.join(",") : p.alpn;
+      if (p["skip-cert-verify"]) params.allow_insecure = 1;
+      const qs = qsBuild(params);
+      return `tuic://${p.uuid}:${encodeURIComponent(p.password)}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "hysteria2": case "hysteria": {
+      if (!p.password) return null;
+      const params = {};
+      const sni = p.sni || p.servername;
+      if (sni) params.sni = sni;
+      if (p["skip-cert-verify"] || p.insecure) params.insecure = 1;
+      if (p.obfs) {
+        params.obfs = p.obfs;
+        if (p["obfs-password"]) params["obfs-password"] = p["obfs-password"];
+      }
+      const qs = qsBuild(params);
+      return `hy2://${encodeURIComponent(p.password)}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "anytls": {
+      const params = {};
+      const sni = p.sni || p.servername;
+      if (sni) params.sni = sni;
+      if (p["skip-cert-verify"] || p.insecure) params.insecure = 1;
+      const qs = qsBuild(params);
+      return `anytls://${encodeURIComponent(p.password || "")}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    default:
+      return null;
+  }
+}
+
+/** sing-box outbound 条目 → 标准 URI（不支持的类型返回 null） */
+export function singboxToUri(o) {
+  const name = o.tag || "";
+  const frag = name ? "#" + encodeURIComponent(name) : "";
+  const host = String(o.server || "").replace(/[\[\]]/g, "");
+  const port = o.server_port;
+  if (!host || !port) return null;
+  const tls = o.tls || {};
+  const tr = o.transport || {};
+  const sni = tls.server_name || "";
+  const insecure = tls.insecure ? 1 : 0;
+  switch (o.type) {
+    case "shadowsocks": {
+      if (!o.method || !o.password) return null;
+      return `ss://${b64encode(`${o.method}:${o.password}`)}@${host}:${port}${frag}`;
+    }
+    case "vmess": {
+      const j = {
+        v: "2", ps: name, add: host, port: String(port), id: o.uuid,
+        aid: String(o.alter_id ?? 0), scy: o.security || "auto",
+        net: tr.type || "tcp", type: "none",
+        host: tr.headers?.Host || "", path: tr.path || "",
+        tls: tls.enabled ? "tls" : "", sni,
+      };
+      return `vmess://${b64encode(JSON.stringify(j))}`;
+    }
+    case "vless": {
+      const params = {};
+      if (tls.enabled) params.security = o.reality?.enabled ? "reality" : "tls";
+      if (sni) params.sni = sni;
+      if (o.flow) params.flow = o.flow;
+      if (tr.type && tr.type !== "tcp") params.type = tr.type;
+      if (tr.path) params.path = tr.path;
+      if (tr.headers?.Host) params.host = tr.headers.Host;
+      if (o.reality?.public_key) params.pbk = o.reality.public_key;
+      if (o.reality?.short_id) params.sid = o.reality.short_id;
+      const qs = qsBuild(params);
+      return `vless://${o.uuid}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "trojan": {
+      const params = {};
+      if (sni) params.sni = sni;
+      if (insecure) params.allowInsecure = 1;
+      const qs = qsBuild(params);
+      return `trojan://${encodeURIComponent(o.password || "")}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "tuic": {
+      if (!o.uuid || !o.password) return null;
+      const params = {};
+      if (sni) params.sni = sni;
+      if (o.congestion_control) params.congestion_control = o.congestion_control;
+      if (tls.alpn) params.alpn = Array.isArray(tls.alpn) ? tls.alpn.join(",") : tls.alpn;
+      if (insecure) params.allow_insecure = 1;
+      const qs = qsBuild(params);
+      return `tuic://${o.uuid}:${encodeURIComponent(o.password)}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "hysteria2": {
+      if (!o.password) return null;
+      const params = {};
+      if (sni) params.sni = sni;
+      if (insecure) params.insecure = 1;
+      if (o.obfs?.type) {
+        params.obfs = o.obfs.type;
+        if (o.obfs.password) params["obfs-password"] = o.obfs.password;
+      }
+      const qs = qsBuild(params);
+      return `hy2://${encodeURIComponent(o.password)}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "anytls": {
+      const params = {};
+      if (sni) params.sni = sni;
+      if (insecure) params.insecure = 1;
+      const qs = qsBuild(params);
+      return `anytls://${encodeURIComponent(o.password || "")}@${host}:${port}${qs ? "?" + qs : ""}${frag}`;
+    }
+    case "http": case "socks": {
+      const auth = o.username
+        ? `${encodeURIComponent(o.username)}:${encodeURIComponent(o.password || "")}@`
+        : "";
+      return `${o.type === "socks" ? "socks5" : "http"}://${auth}${host}:${port}${frag}`;
+    }
+    default:
+      return null;
+  }
+}
+
+/** Clash YAML（proxies: 列表）→ 记录列表；非 YAML 或全部不支持返回 null/[] */
+export function parseClashYaml(body) {
+  const items = parseYamlMapList(body, "proxies");
+  if (!items) return null;
+  return items
+    .map((p) => {
+      const uri = clashToUri(p);
+      return uri ? parseProxyLine(uri) : null;
+    })
+    .filter(Boolean);
+}
+
+/** sing-box YAML 配置（outbounds: 列表）→ 记录列表 */
+export function parseSingBoxYaml(body) {
+  const items = parseYamlMapList(body, "outbounds");
+  if (!items) return null;
+  return items
+    .map((o) => {
+      const uri = singboxToUri(o);
+      return uri ? parseProxyLine(uri) : null;
+    })
+    .filter(Boolean);
+}
+
 export function parseUploadBody(body, contentType) {
   const recs = [];
   const seen = new Set();
@@ -259,6 +629,22 @@ export function parseUploadBody(body, contentType) {
       else push(parseProxyLine(String(item)));
     }
     return recs;
+  }
+  // ---- Clash YAML（proxies:）/ sing-box YAML（outbounds:）整段上传 ----
+  const t = body.trim();
+  if (/^[ \t]*["']?proxies["']?\s*:/m.test(t)) {
+    const recsY = parseClashYaml(body);
+    if (recsY) {
+      for (const rec of recsY) push(rec);
+      return recs;
+    }
+  }
+  if (/^[ \t]*["']?outbounds["']?\s*:/m.test(t)) {
+    const recsY = parseSingBoxYaml(body);
+    if (recsY) {
+      for (const rec of recsY) push(rec);
+      return recs;
+    }
   }
   for (const line of body.split(/\r?\n/)) push(parseProxyLine(line));
   return recs;
@@ -358,34 +744,47 @@ async function listSubs(env) {
 export function toClashProxies(records) {
   const out = [];
   let i = 0;
-  for (const r of records) {
+  for (const r0 of records) {
     i++;
-    const name = `PC-${i}-${r.host || r.proto || "node"}`;
+    const name = `PC-${i}-${r0.host || r0.proto || "node"}`;
     try {
+      // 存储只持久化 {raw, proto, host, port, name}；vmess/vless/ss/trojan/
+      // tuic/hy2/anytls 的结构化字段入库时被剥掉 —— Clash 转换需要时从 raw 重析。
+      // （否则这些协议在这里全部因缺字段被静默跳过，Clash 订阅只剩 http/socks5。）
+      const r = (r0.vmess || r0.vless || r0.ss || r0.trojan || r0.tuic || r0.hy2 || r0.anytls)
+        ? r0
+        : (parseProxyLine(r0.raw) || r0);
       if (r.proto === "http" || r.proto === "https") {
         out.push({
-          name, type: "http", server: r.host.replace(/[\[\]]/g, ""), port: r.port,
+          name: r.name || name, type: "http", server: r.host.replace(/[\[\]]/g, ""), port: r.port,
           ...(r.user ? { username: r.user } : {}), ...(r.pass ? { password: r.pass } : {}),
         });
       } else if (r.proto === "socks5") {
         out.push({
-          name, type: "socks5", server: r.host.replace(/[\[\]]/g, ""), port: r.port,
+          name: r.name || name, type: "socks5", server: r.host.replace(/[\[\]]/g, ""), port: r.port,
           ...(r.user ? { username: r.user } : {}), ...(r.pass ? { password: r.pass } : {}),
         });
       } else if (r.proto === "vmess" && r.vmess) {
+        const ws = r.vmess.net === "ws" ? { path: r.vmess.path, headers: r.vmess.host ? { Host: r.vmess.host } : undefined } : undefined;
         out.push({
           name: r.name || name, type: "vmess", server: r.vmess.add,
           port: parseInt(r.vmess.port, 10), uuid: r.vmess.id,
-          alterId: 0, cipher: r.vmess.scy || "auto",
+          alterId: parseInt(r.vmess.aid || 0, 10) || 0, cipher: r.vmess.scy || "auto",
           ...(r.vmess.net ? { network: r.vmess.net } : {}),
+          ...(r.vmess.tls === "tls" ? { tls: true, servername: r.vmess.sni || r.vmess.add } : {}),
+          ...(ws && r.vmess.path ? { "ws-opts": ws } : {}),
         });
       } else if (r.proto === "vless" && r.vless) {
         const p = r.vless.params || {};
+        const wsOpts = p.type === "ws" && p.path ? { path: p.path, ...(p.host ? { headers: { Host: p.host } } : {}) } : undefined;
         out.push({
           name: r.name || name, type: "vless", server: r.host, port: r.port,
           uuid: r.vless.uuid, udp: true,
+          ...(p.flow ? { flow: p.flow } : {}),
           ...(p.security === "tls" || p.security === "reality" ? { tls: true, servername: p.sni || r.host } : {}),
-          ...(p.type && p.type !== "tcp" ? { network: p.type, "ws-opts": p.path ? { path: p.path } : undefined } : {}),
+          ...(p.security === "reality" ? { "reality-opts": { "public-key": p.pbk, "short-id": p.sid } } : {}),
+          ...(p.fp ? { "client-fingerprint": p.fp } : {}),
+          ...(p.type && p.type !== "tcp" ? { network: p.type, ...(wsOpts ? { "ws-opts": wsOpts } : {}) } : {}),
         });
       } else if (r.proto === "ss" && r.ss) {
         out.push({
@@ -393,9 +792,40 @@ export function toClashProxies(records) {
           cipher: r.ss.method, password: r.ss.password,
         });
       } else if (r.proto === "trojan" && r.trojan) {
+        const p = r.trojan.params || {};
         out.push({
           name: r.name || name, type: "trojan", server: r.host, port: r.port,
-          password: r.trojan.password, sni: r.host,
+          password: r.trojan.password, sni: p.sni || r.host,
+          ...(p.allowInsecure === "1" ? { "skip-cert-verify": true } : {}),
+          ...(p.type && p.type !== "tcp" ? { network: p.type } : {}),
+        });
+      } else if (r.proto === "tuic" && r.tuic) {
+        const p = r.tuic.params || {};
+        out.push({
+          name: r.name || name, type: "tuic", server: r.host, port: r.port,
+          uuid: r.tuic.uuid, password: r.tuic.password, udp: true,
+          ...(p.sni ? { sni: p.sni } : {}),
+          ...(p.congestion_control ? { "congestion-controller": p.congestion_control } : {}),
+          ...(p.alpn ? { alpn: String(p.alpn).split(",") } : {}),
+          ...(p.allow_insecure === "1" ? { "skip-cert-verify": true } : {}),
+        });
+      } else if (r.proto === "hysteria2" && r.hy2) {
+        const p = r.hy2.params || {};
+        out.push({
+          name: r.name || name, type: "hysteria2", server: r.host, port: r.port,
+          password: r.hy2.password, udp: true,
+          ...(p.sni ? { sni: p.sni } : {}),
+          ...(p.obfs ? { obfs: p.obfs } : {}),
+          ...(p["obfs-password"] ? { "obfs-password": p["obfs-password"] } : {}),
+          ...(p.insecure === "1" ? { "skip-cert-verify": true } : {}),
+        });
+      } else if (r.proto === "anytls" && r.anytls) {
+        const p = r.anytls.params || {};
+        out.push({
+          name: r.name || name, type: "anytls", server: r.host, port: r.port,
+          password: r.anytls.password, udp: true,
+          ...(p.sni ? { sni: p.sni } : {}),
+          ...(p.insecure === "1" ? { "skip-cert-verify": true } : {}),
         });
       }
     } catch {}
@@ -663,7 +1093,7 @@ async function api(p,o){const r=await fetch(p,Object.assign({headers:{'content-t
 function renderLogin(msg){app.innerHTML='<div class=card style="max-width:360px;margin:60px auto"><h1>ProxyCollector</h1><p class=sub>管理员登录</p><input id=pw type=password placeholder=管理密码><div style=margin-top:12px><button style=width:100% onclick=doLogin()>登录</button></div><div id=e style=color:#f85149;margin-top:8px>'+esc(msg||'')+'</div></div>';$('#pw').focus();$('#pw').onkeydown=e=>{if(e.key=='Enter')doLogin()}}
 async function doLogin(){try{await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#pw').value})});renderPanel();load()}catch(e){if(e!==0)renderLogin('登录失败')}}
 function renderPanel(){app.innerHTML='<h1>ProxyCollector <button class=ghost style=float:right onclick="location.reload()">刷新</button></h1><p class=sub>代理收集 · 订阅分发 · 过期自动清理</p>'
- +'<div class=card><b>前端提交代理</b><div class=dim style=margin:6px 0>每行一条，支持 vmess:// vless:// ss:// trojan:// socks5:// http:// / host:port:user:pass / host:port；下面选择过期方式</div>'
+ +'<div class=card><b>前端提交代理</b><div class=dim style=margin:6px 0>支持 vmess:// vless:// ss:// trojan:// tuic:// hy2://(hysteria2) anytls:// socks5:// http:// / host:port:user:pass / host:port；也可整段粘贴 Clash YAML（proxies:）或 sing-box 配置（JSON / YAML outbounds:）；下面选择过期方式</div>'
  +'<textarea id=pin placeholder=proxy lines...></textarea><div class=row style=margin-top:8px>'
  +'<select id=pexp style="background:#0d1117;border:1px solid var(--line);color:var(--tx);border-radius:6px;padding:8px"><option value="">永久</option><option value="expiring">7 天（ProxyScrape 试用）</option><option value="custom">自定义…</option></select>'
  +'<input id=pexpv placeholder="如 48h / 7d / 2026-10-01" style="flex:1;display:none">'
