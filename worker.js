@@ -670,7 +670,10 @@ function renderPanel(){app.innerHTML='<h1>ProxyCollector <button class=ghost sty
  +'<button onclick=submitProxies()>提交</button></div><div id=pmsg class=dim style=margin-top:8px></div></div>'
  +'<div class=card><b>创建订阅</b><div class=row style=margin-top:10px><input id=sname placeholder=订阅名 style=flex:2><input id=sdays type=number placeholder=有效期(天,空=永久) style=flex:1><button onclick=createSub()>创建</button></div><div class=dim style=margin-top:6px>订阅按 User-Agent 自动适配 Clash YAML / base64 URI（v2rayN、sing-box 等）</div></div>'
  +'<div class=card><div class=row><b>订阅列表</b><button class=ghost style=margin-left:auto onclick=load()>刷新</button></div><table style=margin-top:10px><thead><tr><th>名称</th><th>链接</th><th>有效期</th><th>状态</th><th>操作</th></tr></thead><tbody id=subs></tbody></table></div>'
- +'<div class=card><div class=row><b>代理池</b><span class=dim style=margin-left:auto id=stat></span><button class=red onclick=purge()>清理过期</button></div><div id=proxies class=mono style=margin-top:10px;max-height:300px;overflow:auto></div></div>'}
+ +'<div class=card><div class=row><b>代理池</b><span class=dim style=margin-left:auto id=stat></span><button class=red onclick=purge()>清理过期</button></div><div id=proxies class=mono style=margin-top:10px;max-height:300px;overflow:auto></div></div>'
+ // #pexp 是本函数动态创建的元素，监听器必须在这里挂（顶层挂会因元素不存在抛
+ // TypeError，整个脚本在登录探测前就死掉 → 面板纯黑一片）
+ ;$('#pexp').addEventListener('change',()=>{$('#pexpv').style.display=$('#pexp').value==='custom'?'block':'none'})}
 async function load(){try{const pr=await api('/api/proxies');
  const _oldest=pr.proxies.reduce((m,p)=>p.added_at&&(!m||p.added_at<m)?p.added_at:m,0);
  $('#stat').textContent='代理 '+pr.count+' 条'+(_oldest?' · 最早 '+new Date(_oldest).toISOString().slice(0,10):'');
@@ -699,7 +702,6 @@ async function submitProxies(){
   $('#pmsg').textContent='已提交: 新增 '+d.added+'，续期 '+d.refreshed+(d.expires_at?'，过期 '+d.expires_at.slice(0,10):'（永久）');
   $('#pin').value='';load()
  }catch(e){$('#pmsg').textContent='提交异常: '+e}}
-$('#pexp').addEventListener('change',()=>{$('#pexpv').style.display=$('#pexp').value==='custom'?'block':'none'});
 async function createSub(){try{const d=await api('/api/subs',{method:'POST',body:JSON.stringify({name:$('#sname').value,expires_days:$('#sdays').value?Number($('#sdays').value):null})});
  navigator.clipboard.writeText(d.url).catch(()=>{});toast('订阅已创建，链接已复制');load()}catch(e){toast('失败: '+e)}}
 async function toggle(id,en){try{await api('/api/subs/'+id+'/update',{method:'POST',body:JSON.stringify({enabled:en})});load()}catch(e){toast('失败: '+e)}}
