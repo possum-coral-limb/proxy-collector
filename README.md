@@ -6,6 +6,27 @@
 
 ## 部署（5 分钟）
 
+### 方式 A：网页控制台部署（无需安装任何工具）
+
+1. **拿代码**：下载 [worker.js](https://raw.githubusercontent.com/possum-coral-limb/proxy-collector/main/worker.js)，
+   复制其**全部内容**。
+2. **创建 Worker**：登录 [dash.cloudflare.com](https://dash.cloudflare.com) →
+   **Workers & Pages → Create → Create Worker** → 起个名字 → Deploy →
+   **Edit code** → 清空示例代码，粘贴 worker.js 全文 → 右上 **Deploy**。
+3. **建 KV 命名空间**：左侧 **Storage & Databases → KV** → **Create namespace**，
+   命名 `PROXY_KV`（名字随意，绑定时对得上即可）。
+4. **绑定 KV**：回到该 Worker → **Settings → Bindings → Add → KV namespace**：
+   变量名填 `PROXY_KV`，选择第 3 步建的命名空间 → Deploy。
+5. **配置密钥**：**Settings → Variables and Secrets** → 逐个 **Add**（类型选 **Secret**）：
+   - `UPLOAD_TOKEN` —— 自定义随机 token（上传认证）
+   - `ADMIN_PASSWORD` —— 自定义管理面板密码
+6. **定时清理**（过期代理每日自动删除）：**Settings → Trigger Events →
+   Cron Triggers** → 添加 `0 19 * * *`（UTC 19:00 = 北京 03:00）。
+7. **记下地址**：Worker 的 **Settings → Domains & Routes** 里形如
+   `https://<name>.<account>.workers.dev`。
+
+### 方式 B：wrangler CLI 部署
+
 ```bash
 npx wrangler login
 npx wrangler kv namespace create PROXY_KV
