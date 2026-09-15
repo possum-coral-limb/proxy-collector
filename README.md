@@ -20,8 +20,9 @@
 5. **配置密钥**：**Settings → Variables and Secrets** → 逐个 **Add**（类型选 **Secret**）：
    - `UPLOAD_TOKEN` —— 自定义随机 token（上传认证）
    - `ADMIN_PASSWORD` —— 自定义管理面板密码
-6. **定时清理**（过期代理每日自动删除）：**Settings → Trigger Events →
-   Cron Triggers** → 添加 `0 19 * * *`（UTC 19:00 = 北京 03:00）。
+6. **定时清理（可选）**：**Settings → Trigger Events → Cron Triggers** → 添加
+   `0 19 * * *`（UTC 19:00 = 北京 03:00）。不配也能正常用——每次拉取订阅/列表
+   时会当场删除过期代理（懒清理）；cron 只是"长期无人拉取时防止过期键堆积"的兜底。
 7. **记下地址**：Worker 的 **Settings → Domains & Routes** 里形如
    `https://<name>.<account>.workers.dev`。
 
