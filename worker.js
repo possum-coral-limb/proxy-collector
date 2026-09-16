@@ -679,6 +679,32 @@ async function putProxy(kv, rec, expiresAt) {
   return "added";
 }
 
+// 上传并发度。putProxy 每条要一次 KV get + 一次 put（几十毫秒级），逐条 await
+// 串行会把人卡在 ~50 条/分钟；并发放到 25 后一批几百条在秒级完成。
+// 上限也受单次请求 subrequest 配额约束（免费版 50 / 付费版 1000）——
+// 调用方（注册器）按批上传，别把整池几千条塞进一次请求。
+const PUT_CONCURRENCY = 25;
+
+async function putProxyBatch(kv, recs, expiresAt) {
+  let added = 0, refreshed = 0, idx = 0;
+  const workers = Array.from(
+    { length: Math.min(PUT_CONCURRENCY, recs.length) },
+    async () => {
+      while (idx < recs.length) {
+        const rec = recs[idx++];
+        try {
+          if ((await putProxy(kv, rec, expiresAt)) === "added") added++;
+          else refreshed++;
+        } catch {
+          // 单条失败不影响整批（KV 瞬时错误等）
+        }
+      }
+    }
+  );
+  await Promise.all(workers);
+  return { added, refreshed };
+}
+
 async function listProxies(kv) {
   const now = Date.now();
   const out = [];
@@ -926,12 +952,7 @@ export default {
       if (recs === null) return jsonResp({ error: "bad request body" }, 400);
       if (!recs.length) return jsonResp({ error: "no valid proxies" }, 400);
 
-      let added = 0,
-        refreshed = 0;
-      for (const rec of recs) {
-        if ((await putProxy(env.PROXY_KV, rec, expiresAt)) === "added") added++;
-        else refreshed++;
-      }
+      const { added, refreshed } = await putProxyBatch(env.PROXY_KV, recs, expiresAt);
       return jsonResp({
         added,
         refreshed,

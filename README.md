@@ -50,6 +50,10 @@ Authorization: Bearer <UPLOAD_TOKEN>
 Content-Type: text/plain（每行一条）或 application/json（{"proxies":[...]} / sing-box {"outbounds":[...]}）
 ```
 
+> **大量代理请分批上传**（每批 ≤ 200 条，例如 `split -l 200 proxies.txt` 后逐批 POST）：
+> 单次请求的 subrequest 配额有限（免费版 50 / 付费版 1000），服务端按并发 25 写 KV；
+> 一批几百条秒级入库，把整池几千条塞进一次请求反而会超配额。
+
 支持的行格式：
 
 ```

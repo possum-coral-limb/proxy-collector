@@ -295,5 +295,34 @@ await t("E2E 混合 URI 行上传（新协议 + 老格式共存）", async () =>
   assert.equal(j.added, 4);
 });
 
+// ---- 6. 上传吞吐：并发写 KV ----
+await t("上传并发（不再逐条串行）", async () => {
+  // 计数 + 记录最大并发：串行实现的最大并发恒为 1（历史：~50 条/分钟）
+  let inFlight = 0, maxInFlight = 0;
+  const kv = {
+    store: new Map(),
+    async get(k) { return this.store.has(k) ? this.store.get(k) : null; },
+    async put(k, v) {
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 5));   // 模拟 KV 往返
+      this.store.set(k, String(v)); inFlight--;
+    },
+    async delete(k) { this.store.delete(k); },
+    async list({ prefix } = {}) {
+      const keys = [...this.store.keys()].filter((k) => k.startsWith(prefix || "")).map((name) => ({ name }));
+      return { keys, list_complete: true };
+    },
+  };
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const body = Array.from({ length: 60 }, (_, i) => `1.2.3.${i % 250}:8080:user${i}:pass${i}`).join("\n");
+  const res = await worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  const j = await res.json();
+  assert.equal(j.added, 60, "60 条应全部入库");
+  assert.ok(maxInFlight > 1, `写入应并发（实测最大并发 ${maxInFlight}）`);
+  assert.ok(maxInFlight <= 25, `并发不得超过 PUT_CONCURRENCY（实测 ${maxInFlight}）`);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
