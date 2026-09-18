@@ -736,6 +736,12 @@ async function putProxyBatch(kv, recs, expiresAt) {
     const now = Date.now();
     added = 0; refreshed = 0;
     const myKeys = new Set();
+    // 写路径顺带清除已过期条目：每次上传都把 blob 里的死数据清掉
+    // （读路径只过滤不写回，见 listProxies 注释）
+    for (const key of Object.keys(store.entries)) {
+      const p = store.entries[key];
+      if (p.expires_at && p.expires_at < now) delete store.entries[key];
+    }
     for (const rec of recs) {
       const key = await sha1Hex(rec.raw);
       myKeys.add(key);
@@ -781,17 +787,14 @@ async function listProxies(kv) {
   const store = await readStore(kv);
   const now = Date.now();
   const out = [];
-  let expired = 0;
   for (const key of Object.keys(store.entries)) {
     const p = store.entries[key];
-    if (p.expires_at && p.expires_at < now) {
-      delete store.entries[key]; // lazy 过期（读路径顺带清理）
-      expired++;
-      continue;
-    }
+    // 纯读过滤：读路径绝不能写回！跨机房读到旧快照时，"清除+写回"会把
+    // 较新的数据整 blob 回滚（实测订阅 4000 → 2000 且无法收敛）。
+    // 过期条目的物理删除发生在写路径（putProxyBatch 顺带清除）与 cron。
+    if (p.expires_at && p.expires_at < now) continue;
     out.push(p);
   }
-  if (expired) await writeStore(kv, store);
   return out;
 }
 

@@ -412,6 +412,30 @@ await t("listSubs 惰性删除过期订阅（面板/列表不再显示）", asyn
   assert.ok(kv.store.has("sub:bbbb2222bbbb2222"), "永久订阅记录应保留");
 });
 
+await t("过期条目：读路径纯过滤不删，下一次上传请求内物理删除", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const post = (body, path = "/api/proxies/expiring") => worker.fetch(new Request("https://w.test" + path, {
+    method: "POST", body, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  await post("9.9.9.9:1111", "/api/proxies/expiring?ttl=1s");
+  await new Promise((r) => setTimeout(r, 1100));
+  // 纯读：输出里没有过期条目，但 blob 不应被读路径改写
+  const list = await (await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" },
+  }), localEnv)).json();
+  assert.ok(!list.proxies.some((p) => p.raw === "9.9.9.9:1111"), "读取应过滤过期条目");
+  let blob = JSON.parse(kv.store.get("store:proxies"));
+  assert.ok(Object.keys(blob.entries).some((k) => blob.entries[k].raw === "9.9.9.9:1111"),
+    "读路径不得写回（跨机房旧快照回滚会丢数据）");
+  // 下一次上传：同一请求内物理删除过期条目
+  await post("8.8.8.8:2222");
+  blob = JSON.parse(kv.store.get("store:proxies"));
+  assert.ok(!Object.keys(blob.entries).some((k) => blob.entries[k].raw === "9.9.9.9:1111"),
+    "上传请求应顺带清除过期条目");
+  assert.ok(Object.keys(blob.entries).some((k) => blob.entries[k].raw === "8.8.8.8:2222"));
+});
+
 async function adminCookie(worker, env) {
   const login = await worker.fetch(new Request("https://w.test/api/login", {
     method: "POST", body: JSON.stringify({ password: env.ADMIN_PASSWORD }),
