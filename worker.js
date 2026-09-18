@@ -666,22 +666,32 @@ export function parseUploadBody(body, contentType) {
 // 与条数无关（2026-09-18 用户实测订阅更新 ~1 分钟后要求改造）。
 //
 // blob 结构：{v, updated_at, entries: {<sha1(raw)>: {raw, proto?, host?, port?,
-//             name?, added_at, expires_at}}}
+//             name?, added_at, expires_at}}, absorbed: ["tmp:<ts>:<sha>", …]}
 //   - entries 用对象按哈希去重，重复上传 = 同键覆盖/续期
 //   - expires_at=null 表示永久
+//   - absorbed = 已整合进本 blob 的 temp 键名（与数据同版本，原子一致）
 //   - 旧格式 p:<sha1> 键在首次读取时自动迁移进 blob 并删除旧键
 //
 // 容量：KV 单值上限 25 MiB；按每条约 150 字节计约可存 10 万条，远超本场景
 // （几千条 ≈ 几百 KB）。写入前超限保护见 STORE_MAX_BYTES。
 //
-// 并发：KV 无原子 CAS，read-modify-write 理论上可能被并发写覆盖。缓解：
-//   1) STORE_REV 乐观校验 —— 写前重读，rev 变了就带着新数据重合并（最多 3 次）；
-//   2) 上传来源（注册器）本身串行分批；cron 清理每日一次。冲突窗口极小，
-//      且最坏后果只是个别代理迟到一轮上传，不会损坏数据。
+// 并发（temp 重做日志保护，见 TEMP_PREFIX 处注释）：
+//   1) 上传先落 temp（WAL），主 blob 无论被谁覆盖，30 分钟内可被整合恢复；
+//   2) 读/写前整合未吸收 temp（只加不减），absorbed 名单避免重复读取；
+//   3) 写后校验 + temp 保留期 GC。读路径整合是纯加法写，最坏被覆盖后自愈。
 // ---------------------------------------------------------------------------
 const STORE_KEY = "store:proxies";
 const STORE_VERSION = 2;
 const STORE_MAX_BYTES = 20 * 1024 * 1024; // 写入保护（KV 上限 25MiB，留余量）
+
+// ---- temp 重做日志（防跨机房写覆盖丢数据的保护机制）----
+// 每次上传先落一条 temp（键 tmp:<毫秒>:<sha1(批次)>，值 {ts, recs 完整记录}），
+// 再动主 blob；任何读/写前把未整合的 temp 吸收进主 blob（只加不减，跳过已过期）。
+// 即使主 blob 被并发旧快照覆盖，temp 在保留期内可被任何后续访问恢复。
+// 主 blob 记录 absorbed 名单（已吸收的 temp 键名，与数据同版本原子共存：
+// 名单说已吸收 ⇒ 该版本数据必在），整合过的 temp 不再重复读取。
+// temp 保留 30 分钟后才由 GC 删除——远大于任何一次 worker 请求的生命周期，
+// "GC 时刻被并发旧写覆盖"的窗口对秒级请求实质关闭。
 
 async function readStore(kv) {
   const raw = await kv.get(STORE_KEY);
@@ -726,18 +736,78 @@ async function writeStore(kv, store) {
   await kv.put(STORE_KEY, body);
 }
 
-/** 单条记录的合并/续期语义（与旧 putProxy 一致）：重复上传延长过期时间 */
-// 注意：KV 无 CAS，多个写入者并发时读-改-写可能互相覆盖（写后校验只能缩小窗口，
-// 无法根除）。上传方必须顺序分批；单写入者（注册器）路径不受影响，重复上传自愈。
+// ---- temp 重做日志 ----
+const TEMP_PREFIX = "tmp:";
+const FOLD_MAX = 20;                    // 每次整合最多吸收的 temp 数（防子请求超限）
+const TEMP_RETAIN_MS = 30 * 60 * 1000;  // temp 保留 30 分钟后 GC
+
+/** WAL 第一步：批次先落 temp。键 tmp:<毫秒>:<sha1(内容)> —— 同毫秒同内容同键
+ *  （覆盖的也是相同内容），其余组合不冲突，天然去重防碰撞。 */
+async function writeTemp(kv, recs, now) {
+  const body = JSON.stringify({ ts: now, recs });
+  const key = TEMP_PREFIX + now + ":" + (await sha1Hex(body));
+  await kv.put(key, body);
+  return key;
+}
+
+/** 读主 blob + 整合未吸收的 temp（只加不减、跳过已过期、每次最多 FOLD_MAX 条）。
+ *  返回 { store, folded }；folded = 本次实际读取并合并的 temp 键名，
+ *  调用方写回主 blob 时记入 absorbed。temp 在保留期内被覆盖也能由此恢复。 */
+async function loadStore(kv) {
+  const store = await readStore(kv);
+  if (!store.absorbed) store.absorbed = [];
+  const absorbed = new Set(store.absorbed);
+  const pending = [];
+  let cursor;
+  do {
+    const page = await kv.list({ prefix: TEMP_PREFIX, cursor });
+    for (const k of page.keys) {
+      if (!absorbed.has(k.name)) pending.push(k.name);
+    }
+    cursor = page.list_complete ? undefined : page.list_cursor;
+  } while (cursor);
+  const folded = [];
+  const now = Date.now();
+  for (const name of pending.slice(0, FOLD_MAX)) {
+    const raw = await kv.get(name);
+    if (!raw) continue; // 可能刚被 GC：跳过，不记 absorbed
+    let t;
+    try { t = JSON.parse(raw); } catch { continue; }
+    for (const rec of t.recs || []) {
+      if (!rec || !rec.raw) continue;
+      if (rec.expires_at && rec.expires_at < now) continue; // 过期条目不复活
+      store.entries[await sha1Hex(rec.raw)] = rec; // temp 是较新写入者的意图，整体覆盖
+    }
+    folded.push(name);
+  }
+  return { store, folded };
+}
+
+/** GC：删除已吸收且超过保留期的 temp，并修剪 absorbed 名单（防无限增长）。
+ *  必须在把 absorbed 名单写回主 blob **之后**调用。 */
+async function gcTemps(kv, store) {
+  const now = Date.now();
+  const keep = [];
+  for (const name of store.absorbed || []) {
+    const ts = parseInt(name.slice(TEMP_PREFIX.length), 10);
+    if (!Number.isFinite(ts)) { keep.push(name); continue; }
+    if (now - ts >= TEMP_RETAIN_MS) await kv.delete(name).catch(() => {});
+    else keep.push(name);
+  }
+  store.absorbed = keep.slice(-500);
+}
+
+/** 上传写路径：先落 temp（WAL），再整合+合并+写主 blob+写后校验。
+ *  KV 无 CAS，跨机房旧写仍可能覆盖主 blob——但本批数据在 temp 里，
+ *  30 分钟内任何访问都会把它整合回来（见 loadStore）。 */
 async function putProxyBatch(kv, recs, expiresAt) {
-  let added = 0, refreshed = 0;
+  let added = 0, refreshed = 0, tempKey = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const store = await readStore(kv);
+    const { store, folded } = await loadStore(kv);
     const now = Date.now();
     added = 0; refreshed = 0;
     const myKeys = new Set();
-    // 写路径顺带清除已过期条目：每次上传都把 blob 里的死数据清掉
-    // （读路径只过滤不写回，见 listProxies 注释）
+    // 写路径顺带清除已过期条目（temp 整合本身跳过过期，不会复活）
     for (const key of Object.keys(store.entries)) {
       const p = store.entries[key];
       if (p.expires_at && p.expires_at < now) delete store.entries[key];
@@ -763,6 +833,17 @@ async function putProxyBatch(kv, recs, expiresAt) {
         added++;
       }
     }
+    // WAL：首次尝试把合并结果（解析后的完整记录）落 temp；
+    // 立即记入 absorbed——本批数据已在此后写出的主 blob 版本中（原子一致），
+    // 后续读/写不再重复吸收本 temp。
+    if (!tempKey) {
+      tempKey = await writeTemp(kv, [...myKeys].map((k) => store.entries[k]), now);
+      if (!store.absorbed.includes(tempKey)) store.absorbed.push(tempKey);
+    }
+    if (folded.length) store.absorbed = store.absorbed.concat(folded);
+    // GC 在写主 blob 之前：超期 temp 已吸收 ≥30 分钟，任何秒级请求的基线
+    // 都必含其数据，先删安全；修剪后的 absorbed 名单随本次 writeStore 落盘
+    await gcTemps(kv, store);
     try {
       await writeStore(kv, store);
     } catch (e) {
@@ -771,8 +852,7 @@ async function putProxyBatch(kv, recs, expiresAt) {
       // 瞬时错误：重读合并重试
       continue;
     }
-    // KV 无 CAS：并发写者的读-改-写可能整体覆盖掉本批（丢条目）。
-    // 写后重读校验本批条目齐全，缺失则基于最新快照重合并重试。
+    // 写后重读校验本批条目齐全，缺失则基于最新快照重合并重试
     const verify = await readStore(kv);
     let missing = false;
     for (const k of myKeys) {
@@ -783,15 +863,19 @@ async function putProxyBatch(kv, recs, expiresAt) {
   return { added, refreshed };
 }
 
+/** 读路径：整合 pending temp（只加不减的写，安全——最坏被覆盖，temp 还在），
+ *  无 temp 时零写入。过期条目只过滤不删（物理删除在写路径与 cron）。 */
 async function listProxies(kv) {
-  const store = await readStore(kv);
+  const { store, folded } = await loadStore(kv);
+  if (folded.length) {
+    store.absorbed = store.absorbed.concat(folded);
+    await gcTemps(kv, store);
+    await writeStore(kv, store);
+  }
   const now = Date.now();
   const out = [];
   for (const key of Object.keys(store.entries)) {
     const p = store.entries[key];
-    // 纯读过滤：读路径绝不能写回！跨机房读到旧快照时，"清除+写回"会把
-    // 较新的数据整 blob 回滚（实测订阅 4000 → 2000 且无法收敛）。
-    // 过期条目的物理删除发生在写路径（putProxyBatch 顺带清除）与 cron。
     if (p.expires_at && p.expires_at < now) continue;
     out.push(p);
   }
@@ -799,7 +883,7 @@ async function listProxies(kv) {
 }
 
 async function purgeExpired(kv) {
-  const store = await readStore(kv);
+  const { store, folded } = await loadStore(kv);
   const now = Date.now();
   let removed = 0;
   for (const key of Object.keys(store.entries)) {
@@ -809,7 +893,11 @@ async function purgeExpired(kv) {
       removed++;
     }
   }
-  if (removed) await writeStore(kv, store);
+  if (removed || folded.length) {
+    if (folded.length) store.absorbed = store.absorbed.concat(folded);
+    await gcTemps(kv, store);
+    await writeStore(kv, store);
+  }
   return removed;
 }
 

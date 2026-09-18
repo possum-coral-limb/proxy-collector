@@ -325,16 +325,90 @@ await t("上传一批 = 2 读 + 1 写（含写后完整性校验）", async () =
   const j1 = await (await post(body1)).json();
   assert.equal(j1.added, 200, "200 条应全部入库");
   assert.equal(kv.counts.get, 2, `上传应 2 次读（合并 + 写后校验，实测 ${kv.counts.get}）`);
-  assert.equal(kv.counts.put, 1, `上传只应 1 次写（实测 ${kv.counts.put}）`);
-  assert.ok(kv.counts.list <= 1, `首次最多 1 次迁移探测（实测 ${kv.counts.list}）`);
+  assert.equal(kv.counts.put, 2, `上传应 2 次写（temp WAL + 主 blob，实测 ${kv.counts.put}）`);
+  assert.ok(kv.counts.list <= 2, `首次最多迁移+temp 探测各 1 次（实测 ${kv.counts.list}）`);
   // 第二次上传：稳态 —— 不再有任何 list
   kv.counts.get = kv.counts.put = kv.counts.list = 0;
   const body2 = Array.from({ length: 200 }, (_, i) => `10.9.${i % 250}.${(i + 7) % 250}:8080`).join("\n");
   const j2 = await (await post(body2)).json();
   assert.equal(j2.added, 200);
   assert.equal(kv.counts.get, 2, `稳态上传应 2 次读（实测 ${kv.counts.get}）`);
-  assert.equal(kv.counts.put, 1, `稳态上传只应 1 次写（实测 ${kv.counts.put}）`);
-  assert.equal(kv.counts.list, 0, `稳态上传不应触发 list（实测 ${kv.counts.list}）`);
+  assert.equal(kv.counts.put, 2, `稳态上传 2 次写（temp + 主 blob，实测 ${kv.counts.put}）`);
+  assert.equal(kv.counts.list, 1, `稳态上传仅 1 次temp探测 list（实测 ${kv.counts.list}）`);
+});
+
+await t("temp 自愈：主 blob 被旧版本覆盖后，temp 恢复丢失批次", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const post = (body) => worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  await post("1.1.1.1:100\n2.2.2.2:200");
+  const stale = kv.store.get("store:proxies"); // A 批之后的快照（不含 B 批）
+  await post("3.3.3.3:300");
+  assert.equal(JSON.parse(kv.store.get("store:proxies")).entries &&
+    Object.keys(JSON.parse(kv.store.get("store:proxies")).entries).length, 3, "正常应 3 条");
+  // 模拟跨机房旧写覆盖：主 blob 回滚到不含 3.3.3.3 的版本
+  kv.store.set("store:proxies", stale);
+  const list = await (await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" } }), localEnv)).json();
+  assert.equal(list.count, 3, "读时整合 temp 应恢复被覆盖的 3.3.3.3");
+  const raws = list.proxies.map((p) => p.raw);
+  assert.ok(raws.includes("3.3.3.3:300"), "丢失批次应从 temp 恢复");
+});
+
+await t("temp 整合上限：每次最多吸收 20 条，多次读逐步收敛", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const now = Date.now();
+  for (let i = 0; i < 25; i++) {
+    const rec = { raw: `10.5.0.${i}:9000`, proto: null, host: null, port: null,
+      name: null, added_at: now, expires_at: null };
+    const body = JSON.stringify({ ts: now, recs: [rec] });
+    await kv.put(`tmp:${now}:${i}`, body);
+  }
+  const get = () => worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" } }), localEnv);
+  const l1 = await (await get()).json();
+  assert.equal(l1.count, 20, "第一次读只吸收 20 条");
+  const l2 = await (await get()).json();
+  assert.equal(l2.count, 25, "第二次读吸收剩余 5 条（absorbed 名单跳过已吸收）");
+  const blob = JSON.parse(kv.store.get("store:proxies"));
+  assert.equal(blob.absorbed.length, 25, "absorbed 名单应记全 25 条");
+});
+
+await t("GC：吸收超过 30 分钟的 temp 删除，未到期保留", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const now = Date.now();
+  const oldT = `tmp:${now - 31 * 60 * 1000}:old`;
+  const newT = `tmp:${now}:new`;
+  await kv.put(oldT, JSON.stringify({ ts: now - 31 * 60 * 1000,
+    recs: [{ raw: "7.7.7.7:1", proto: null, host: null, port: null, name: null, added_at: now, expires_at: null }] }));
+  await kv.put(newT, JSON.stringify({ ts: now,
+    recs: [{ raw: "8.8.8.8:2", proto: null, host: null, port: null, name: null, added_at: now, expires_at: null }] }));
+  // 直接把两条 temp 标记为已吸收，再触发一次写路径（上传）跑 GC
+  const blob = JSON.parse(kv.store.get("store:proxies") || JSON.stringify(
+    { v: 2, updated_at: now, entries: {}, absorbed: [] }));
+  blob.absorbed = [oldT, newT];
+  await kv.put("store:proxies", JSON.stringify(blob));
+  await worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body: "9.9.9.9:3", headers: { authorization: "Bearer tok" } }), localEnv);
+  assert.ok(!kv.store.has(oldT), "超期 temp 应被 GC 删除");
+  assert.ok(kv.store.has(newT), "未到期 temp 应保留");
+  assert.ok(!JSON.parse(kv.store.get("store:proxies")).absorbed.includes(oldT), "absorbed 名单应修剪");
+});
+
+await t("temp 里的过期条目不复活", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const now = Date.now();
+  await kv.put(`tmp:${now}:exp`, JSON.stringify({ ts: now, recs: [
+    { raw: "6.6.6.6:666", proto: null, host: null, port: null, name: null,
+      added_at: now - 8000000, expires_at: now - 1000 } ] }));
+  const list = await (await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" } }), localEnv)).json();
+  assert.ok(!list.proxies.some((p) => p.raw === "6.6.6.6:666"), "过期条目不应被整合出来");
 });
 
 await t("并发上传竞态：写后校验缩小丢失窗口，后续顺序重传自愈", async () => {  const kv = countingKv();
