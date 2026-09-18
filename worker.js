@@ -813,11 +813,19 @@ async function purgeExpired(kv) {
 async function listSubs(env) {
   const subs = [];
   let cursor;
+  const now = Date.now();
   do {
     const page = await env.PROXY_KV.list({ prefix: "sub:", cursor });
     for (const k of page.keys) {
       const raw = await env.PROXY_KV.get(k.name);
-      if (raw) subs.push(JSON.parse(raw));
+      if (!raw) continue;
+      const sub = JSON.parse(raw);
+      // 过期订阅顺带删除（与代理的 lazy 过期一致），面板与列表不再显示
+      if (sub.expires_at && sub.expires_at < now) {
+        await env.PROXY_KV.delete(k.name);
+        continue;
+      }
+      subs.push(sub);
     }
     cursor = page.list_complete ? undefined : page.list_cursor;
   } while (cursor);
@@ -1115,8 +1123,11 @@ export default {
       const sub = JSON.parse(raw);
       if (!sub.enabled) return new Response("subscription disabled", { status: 403 });
       if (sub.key !== url.searchParams.get("key")) return new Response("bad key", { status: 403 });
-      if (sub.expires_at && Date.now() > sub.expires_at)
+      if (sub.expires_at && Date.now() > sub.expires_at) {
+        // 过期订阅：删除记录后拒绝访问（下次访问 404）
+        await env.PROXY_KV.delete("sub:" + subFetch[1]);
         return new Response("subscription expired", { status: 403 });
+      }
 
       const records = await listProxies(env.PROXY_KV);
       if (!records.length) return new Response("no proxies available", { status: 503 });
@@ -1145,7 +1156,9 @@ export default {
   },
 
   async scheduled(event, env) {
-    console.log(`[cron] purged ${await purgeExpired(env.PROXY_KV)} expired proxies`);
+    const removed = await purgeExpired(env.PROXY_KV);
+    const subs = await listSubs(env); // listSubs 顺带删除过期订阅
+    console.log(`[cron] purged ${removed} expired proxies, ${subs.length} active subs`);
   },
 };
 

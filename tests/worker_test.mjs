@@ -380,6 +380,38 @@ await t("订阅下发 = 1 次读（200 条，不再逐条 get）", async () => {
   assert.equal(kv.counts.get, 2, `订阅下发应只 2 次 KV get（实测 ${kv.counts.get}）`);
 });
 
+await t("过期订阅：访问 403 且记录被删（再访 404）", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  await kv.put("sub:deadbeefdeadbeef", JSON.stringify({
+    id: "deadbeefdeadbeef", name: "old", key: "k".repeat(32),
+    created_at: Date.now() - 86400000, expires_at: Date.now() - 1000, enabled: true,
+  }));
+  const r1 = await worker.fetch(new Request("https://w.test/sub/deadbeefdeadbeef?key=" + "k".repeat(32), {
+    headers: { "user-agent": "curl/8.0" } }), localEnv);
+  assert.equal(r1.status, 403, "过期订阅访问应 403");
+  assert.ok(!kv.store.has("sub:deadbeefdeadbeef"), "过期订阅记录应被删除");
+  const r2 = await worker.fetch(new Request("https://w.test/sub/deadbeefdeadbeef?key=" + "k".repeat(32), {
+    headers: { "user-agent": "curl/8.0" } }), localEnv);
+  assert.equal(r2.status, 404, "记录删除后再访问应 404");
+});
+
+await t("listSubs 惰性删除过期订阅（面板/列表不再显示）", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const mk = (id, exp) => JSON.stringify({ id, name: id, key: "k".repeat(32), created_at: 1, expires_at: exp, enabled: true });
+  await kv.put("sub:aaaa1111aaaa1111", mk("aaaa1111aaaa1111", Date.now() - 1000));
+  await kv.put("sub:bbbb2222bbbb2222", mk("bbbb2222bbbb2222", null));
+  const cookie = await adminCookie(worker, localEnv);
+  const res = await worker.fetch(new Request("https://w.test/api/proxies", { headers: { cookie } }), localEnv);
+  const j = await res.json();
+  const ids = (j.subs || []).map((x) => x.id);
+  assert.ok(!ids.includes("aaaa1111aaaa1111"), "过期订阅不应出现在列表");
+  assert.ok(ids.includes("bbbb2222bbbb2222"), "永久订阅应保留");
+  assert.ok(!kv.store.has("sub:aaaa1111aaaa1111"), "过期订阅记录应被删除");
+  assert.ok(kv.store.has("sub:bbbb2222bbbb2222"), "永久订阅记录应保留");
+});
+
 async function adminCookie(worker, env) {
   const login = await worker.fetch(new Request("https://w.test/api/login", {
     method: "POST", body: JSON.stringify({ password: env.ADMIN_PASSWORD }),
