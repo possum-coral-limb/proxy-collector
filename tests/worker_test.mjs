@@ -436,6 +436,28 @@ await t("过期条目：读路径纯过滤不删，下一次上传请求内物�
   assert.ok(Object.keys(blob.entries).some((k) => blob.entries[k].raw === "8.8.8.8:2222"));
 });
 
+await t("GET /api/proxies 支持 limit/q（面板轻量拉取，默认全量不变）", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const post = (body) => worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  await post(Array.from({ length: 150 }, (_, i) => `172.${i}.0.1:8080`).join("\n"));
+  await post("10.0.0.42:9999");
+  const full = await (await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" } }), localEnv)).json();
+  assert.equal(full.count, 151, "无参数应返回全量");
+  assert.equal(full.proxies.length, 151);
+  const limited = await (await worker.fetch(new Request("https://w.test/api/proxies?limit=10", {
+    headers: { authorization: "Bearer tok" } }), localEnv)).json();
+  assert.equal(limited.count, 151, "count 应为匹配总数而非返回条数");
+  assert.equal(limited.proxies.length, 10, "limit 应截断返回");
+  const q1 = await (await worker.fetch(new Request("https://w.test/api/proxies?q=10.0.0.42", {
+    headers: { authorization: "Bearer tok" } }), localEnv)).json();
+  assert.equal(q1.count, 1, "q 子串过滤");
+  assert.equal(q1.proxies[0].raw, "10.0.0.42:9999");
+});
+
 async function adminCookie(worker, env) {
   const login = await worker.fetch(new Request("https://w.test/api/login", {
     method: "POST", body: JSON.stringify({ password: env.ADMIN_PASSWORD }),

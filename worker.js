@@ -1069,11 +1069,18 @@ export default {
           (env.UPLOAD_TOKEN && token === env.UPLOAD_TOKEN) ||
           !adminAuth(request, env);
         if (!authorized) return jsonResp({ error: "unauthorized" }, 401);
-        const proxies = await listProxies(env.PROXY_KV);
+        let proxies = await listProxies(env.PROXY_KV);
+        // 可选参数（面板专用轻量拉取；不带参数 = 全量，外部出口池拉取不变）：
+        //   q=子串 → 按 raw 过滤；limit=N → 只返回最新 N 条
+        const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+        if (q) proxies = proxies.filter((p) => p.raw && p.raw.toLowerCase().includes(q));
         proxies.sort((a, b) => b.added_at - a.added_at);
+        const limit = parseInt(url.searchParams.get("limit") || "0", 10);
+        const total = proxies.length; // 匹配总数（limit 截断后仍返回真实总数）
+        if (limit > 0) proxies = proxies.slice(0, limit);
         // 面板一次取回代理 + 订阅（load() 读 pr.subs）
         return jsonResp({
-          count: proxies.length,
+          count: total,
           proxies,
           subs: await listSubs(env),
         });
@@ -1205,13 +1212,18 @@ function renderPanel(){app.innerHTML='<h1>ProxyCollector <button class=ghost sty
  +'<button onclick=submitProxies()>提交</button></div><div id=pmsg class=dim style=margin-top:8px></div></div>'
  +'<div class=card><b>创建订阅</b><div class=row style=margin-top:10px><input id=sname placeholder=订阅名 style=flex:2><input id=sdays type=number placeholder=有效期(天,空=永久) style=flex:1><button onclick=createSub()>创建</button></div><div class=dim style=margin-top:6px>订阅按 User-Agent 自动适配 Clash YAML / base64 URI（v2rayN、sing-box 等）</div></div>'
  +'<div class=card><div class=row><b>订阅列表</b><button class=ghost style=margin-left:auto onclick=load()>刷新</button></div><table style=margin-top:10px><thead><tr><th>名称</th><th>链接</th><th>有效期</th><th>状态</th><th>操作</th></tr></thead><tbody id=subs></tbody></table></div>'
- +'<div class=card><div class=row><b>代理池</b><span class=dim style=margin-left:auto id=stat></span><button class=red onclick=purge()>清理过期</button></div><div id=proxies class=mono style=margin-top:10px;max-height:300px;overflow:auto></div></div>'
+ +'<div class=card><div class=row><b>代理池</b><span class=dim style=margin-left:auto id=stat></span><button class=red onclick=purge()>清理过期</button></div>'
+ +'<div class=row style=margin-top:8px><input id=pq placeholder="搜索（子串，留空=最新）" style=flex:1><button class=ghost onclick=load()>搜索</button></div>'
+ +'<div id=proxies class=mono style=margin-top:10px;max-height:300px;overflow:auto></div></div>'
  // #pexp 是本函数动态创建的元素，监听器必须在这里挂（顶层挂会因元素不存在抛
  // TypeError，整个脚本在登录探测前就死掉 → 面板纯黑一片）
- ;$('#pexp').addEventListener('change',()=>{$('#pexpv').style.display=$('#pexp').value==='custom'?'block':'none'})}
-async function load(){try{const pr=await api('/api/proxies');
+ ;$('#pexp').addEventListener('change',()=>{$('#pexpv').style.display=$('#pexp').value==='custom'?'block':'none'});bindPqDebounce()}
+const PAGE = 60; // 面板每页拉取条数——只显示最新一页，全量匹配数走 count 字段
+async function load(){try{
+ const q=($('#pq')&&$('#pq').value.trim())||'';
+ const pr=await api('/api/proxies?limit='+PAGE+(q?'&q='+encodeURIComponent(q):''));
  const _oldest=pr.proxies.reduce((m,p)=>p.added_at&&(!m||p.added_at<m)?p.added_at:m,0);
- $('#stat').textContent='代理 '+pr.count+' 条'+(_oldest?' · 最早 '+new Date(_oldest).toISOString().slice(0,10):'');
+ $('#stat').textContent='匹配 '+pr.count+' 条'+(_oldest?' · 最早 '+new Date(_oldest).toISOString().slice(0,10):'');
  $('#subs').innerHTML=pr.subs.map(s=>'<tr><td>'+esc(s.name)+'</td>'
   +'<td class=mono><a href="/sub/'+s.id+'?key='+esc(s.key)+'" target=_blank style=color:var(--blue)>/sub/'+esc(s.id.slice(0,8))+'…</a> '
   +'<button class=ghost style="padding:2px 6px;font-size:10px" onclick="copySub(\\\''+esc(s.id)+'\\\',\\\''+esc(s.key)+'\\\')">复制</button></td>'
@@ -1220,8 +1232,11 @@ async function load(){try{const pr=await api('/api/proxies');
   +'<td><button class=ghost onclick=toggle(\\\''+esc(s.id)+'\\\','+(!s.enabled)+')>'+(s.enabled?'禁用':'启用')+'</button> '
   +'<button class=red onclick=del(\\\''+esc(s.id)+'\\\')>删除</button></td></tr>').join('')
   ||'<tr><td colspan=5 class=dim>暂无订阅</td></tr>';
- $('#proxies').innerHTML=pr.proxies.slice(0,60).map(p=>'<div>'+esc(p.raw.slice(0,90))+(p.expires_at?' <span class=dim>[至 '+new Date(p.expires_at).toISOString().slice(0,10)+']</span>':'')+'</div>').join('')
-  +'<div class=dim>（最近 60 条，共 '+pr.count+' 条；无标记 = 永久）</div>'}catch(e){if(e!==0)toast('加载失败: '+e)}}
+ $('#proxies').innerHTML=pr.proxies.map(p=>'<div>'+esc(p.raw.slice(0,90))+(p.expires_at?' <span class=dim>[至 '+new Date(p.expires_at).toISOString().slice(0,10)+']</span>':'')+'</div>').join('')
+  ||'<div class=dim>无匹配</div>'
+  +'<div class=dim>（'+(q?'匹配 ':'最新 ')+pr.proxies.length+' 条，共 '+pr.count+' 条；无标记 = 永久）</div>'}catch(e){if(e!==0)toast('加载失败: '+e)}}
+let _pqTimer;
+function bindPqDebounce(){const el=$('#pq');if(!el)return;el.addEventListener('input',()=>{clearTimeout(_pqTimer);_pqTimer=setTimeout(load,300)});el.addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(_pqTimer);load()}})}
 function copySub(id,key){navigator.clipboard.writeText(location.origin+'/sub/'+id+'?key='+key).then(()=>toast('订阅链接已复制'),()=>toast('复制失败，请手动复制'))}
 async function submitProxies(){
  const mode=$('#pexp').value, custom=$('#pexpv').value.trim();
