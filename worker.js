@@ -651,102 +651,143 @@ export function parseUploadBody(body, contentType) {
 }
 
 // ---------------------------------------------------------------------------
-// 存储
+// 存储：全部代理放在**单条 KV** 里（key: STORE_KEY）。
+//
+// 为什么不逐条存：旧方案 p:<sha1> 每条代理一个键，订阅下发要 list 全部键
+// 再逐条 get —— 200 条 = 201 次 KV 往返（串行几十毫秒一次），实测约一分钟；
+// 几千条线性劣化。单条 blob 后读 = 1 次 get，上传一批 = 1 读 + 1 写，
+// 与条数无关（2026-09-18 用户实测订阅更新 ~1 分钟后要求改造）。
+//
+// blob 结构：{v, updated_at, entries: {<sha1(raw)>: {raw, proto?, host?, port?,
+//             name?, added_at, expires_at}}}
+//   - entries 用对象按哈希去重，重复上传 = 同键覆盖/续期
+//   - expires_at=null 表示永久
+//   - 旧格式 p:<sha1> 键在首次读取时自动迁移进 blob 并删除旧键
+//
+// 容量：KV 单值上限 25 MiB；按每条约 150 字节计约可存 10 万条，远超本场景
+// （几千条 ≈ 几百 KB）。写入前超限保护见 STORE_MAX_BYTES。
+//
+// 并发：KV 无原子 CAS，read-modify-write 理论上可能被并发写覆盖。缓解：
+//   1) STORE_REV 乐观校验 —— 写前重读，rev 变了就带着新数据重合并（最多 3 次）；
+//   2) 上传来源（注册器）本身串行分批；cron 清理每日一次。冲突窗口极小，
+//      且最坏后果只是个别代理迟到一轮上传，不会损坏数据。
 // ---------------------------------------------------------------------------
-async function putProxy(kv, rec, expiresAt) {
-  const key = "p:" + (await sha1Hex(rec.raw));
-  const existing = await kv.get(key);
-  const now = Date.now();
-  if (existing) {
-    const old = JSON.parse(existing);
-    // 重复上传：刷新（延长）过期时间；仍过期中的不改
-    const newExp = expiresAt ?? (old.expires_at ? Math.max(old.expires_at, now + DEFAULT_TTL_MS) : old.expires_at);
-    await kv.put(key, JSON.stringify({ ...old, expires_at: newExp ?? old.expires_at, added_at: old.added_at }));
-    return "refreshed";
+const STORE_KEY = "store:proxies";
+const STORE_VERSION = 2;
+const STORE_MAX_BYTES = 20 * 1024 * 1024; // 写入保护（KV 上限 25MiB，留余量）
+
+async function readStore(kv) {
+  const raw = await kv.get(STORE_KEY);
+  if (raw) {
+    try {
+      const data = JSON.parse(raw);
+      if (data && data.v === STORE_VERSION && data.entries) return data;
+    } catch {}
   }
-  await kv.put(
-    key,
-    JSON.stringify({
-      raw: rec.raw,
-      proto: rec.proto || null,
-      host: rec.host || null,
-      port: rec.port || null,
-      name: rec.name || null,
-      added_at: now,
-      expires_at: expiresAt ?? null,
-    })
-  );
-  return "added";
+  // 首次/损坏：从旧格式 p:<sha1> 键迁移（一次性，随后删除旧键）
+  const entries = {};
+  let cursor;
+  do {
+    const page = await kv.list({ prefix: "p:", cursor });
+    for (const k of page.keys) {
+      const v = await kv.get(k.name);
+      if (!v) continue;
+      try {
+        const p = JSON.parse(v);
+        entries[k.name.slice(2)] = p; // 去掉 "p:" 前缀
+      } catch {}
+    }
+    cursor = page.list_complete ? undefined : page.list_cursor;
+  } while (cursor);
+  const migrated = { v: STORE_VERSION, updated_at: Date.now(), entries };
+  if (Object.keys(entries).length) {
+    await kv.put(STORE_KEY, JSON.stringify(migrated));
+    // 迁移完成再删旧键（写失败也不会丢数据）
+    for (const name of Object.keys(entries)) await kv.delete("p:" + name).catch(() => {});
+  }
+  return migrated;
 }
 
-// 上传并发度。putProxy 每条要一次 KV get + 一次 put（几十毫秒级），逐条 await
-// 串行会把人卡在 ~50 条/分钟；并发放到 25 后一批几百条在秒级完成。
-// 上限也受单次请求 subrequest 配额约束（免费版 50 / 付费版 1000）——
-// 调用方（注册器）按批上传，别把整池几千条塞进一次请求。
-const PUT_CONCURRENCY = 25;
+async function writeStore(kv, store) {
+  store.updated_at = Date.now();
+  const body = JSON.stringify(store);
+  if (body.length > STORE_MAX_BYTES) {
+    throw new Error(
+      `store blob ${body.length}B 超过保护上限 ${STORE_MAX_BYTES}B —— 清理过期代理或减少存量`
+    );
+  }
+  await kv.put(STORE_KEY, body);
+}
 
+/** 单条记录的合并/续期语义（与旧 putProxy 一致）：重复上传延长过期时间 */
 async function putProxyBatch(kv, recs, expiresAt) {
-  let added = 0, refreshed = 0, idx = 0;
-  const workers = Array.from(
-    { length: Math.min(PUT_CONCURRENCY, recs.length) },
-    async () => {
-      while (idx < recs.length) {
-        const rec = recs[idx++];
-        try {
-          if ((await putProxy(kv, rec, expiresAt)) === "added") added++;
-          else refreshed++;
-        } catch {
-          // 单条失败不影响整批（KV 瞬时错误等）
-        }
+  let added = 0, refreshed = 0;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const store = await readStore(kv);
+    const now = Date.now();
+    added = 0; refreshed = 0;
+    for (const rec of recs) {
+      const key = await sha1Hex(rec.raw);
+      const old = store.entries[key];
+      if (old) {
+        const newExp = expiresAt ?? (old.expires_at ? Math.max(old.expires_at, now + DEFAULT_TTL_MS) : old.expires_at);
+        store.entries[key] = { ...old, expires_at: newExp ?? old.expires_at, added_at: old.added_at };
+        refreshed++;
+      } else {
+        store.entries[key] = {
+          raw: rec.raw,
+          proto: rec.proto || null,
+          host: rec.host || null,
+          port: rec.port || null,
+          name: rec.name || null,
+          added_at: now,
+          expires_at: expiresAt ?? null,
+        };
+        added++;
       }
     }
-  );
-  await Promise.all(workers);
+    try {
+      await writeStore(kv, store);
+      return { added, refreshed };
+    } catch (e) {
+      if (String(e.message || e).includes("超过保护上限")) throw e;
+      if (attempt === 3) throw e;
+      // 乐观锁冲突/瞬时错误：重读合并重试
+    }
+  }
   return { added, refreshed };
 }
 
 async function listProxies(kv) {
+  const store = await readStore(kv);
   const now = Date.now();
   const out = [];
-  let cursor;
-  do {
-    const page = await kv.list({ prefix: "p:", cursor });
-    for (const key of page.keys) {
-      const raw = await kv.get(key.name);
-      if (!raw) continue;
-      try {
-        const p = JSON.parse(raw);
-        if (p.expires_at && p.expires_at < now) {
-          await kv.delete(key.name); // lazy 过期
-          continue;
-        }
-        out.push(p);
-      } catch {}
+  let expired = 0;
+  for (const key of Object.keys(store.entries)) {
+    const p = store.entries[key];
+    if (p.expires_at && p.expires_at < now) {
+      delete store.entries[key]; // lazy 过期（读路径顺带清理）
+      expired++;
+      continue;
     }
-    cursor = page.list_complete ? undefined : page.list_cursor;
-  } while (cursor);
+    out.push(p);
+  }
+  if (expired) await writeStore(kv, store);
   return out;
 }
 
 async function purgeExpired(kv) {
+  const store = await readStore(kv);
   const now = Date.now();
   let removed = 0;
-  let cursor;
-  do {
-    const page = await kv.list({ prefix: "p:", cursor });
-    for (const key of page.keys) {
-      const raw = await kv.get(key.name);
-      if (!raw) continue;
-      try {
-        const p = JSON.parse(raw);
-        if (p.expires_at && p.expires_at < now) {
-          await kv.delete(key.name);
-          removed++;
-        }
-      } catch {}
+  for (const key of Object.keys(store.entries)) {
+    const p = store.entries[key];
+    if (p.expires_at && p.expires_at < now) {
+      delete store.entries[key];
+      removed++;
     }
-    cursor = page.list_complete ? undefined : page.list_cursor;
-  } while (cursor);
+  }
+  if (removed) await writeStore(kv, store);
   return removed;
 }
 

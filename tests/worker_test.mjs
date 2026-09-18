@@ -295,33 +295,117 @@ await t("E2E 混合 URI 行上传（新协议 + 老格式共存）", async () =>
   assert.equal(j.added, 4);
 });
 
-// ---- 6. 上传吞吐：并发写 KV ----
-await t("上传并发（不再逐条串行）", async () => {
-  // 计数 + 记录最大并发：串行实现的最大并发恒为 1（历史：~50 条/分钟）
-  let inFlight = 0, maxInFlight = 0;
-  const kv = {
-    store: new Map(),
-    async get(k) { return this.store.has(k) ? this.store.get(k) : null; },
-    async put(k, v) {
-      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
-      await new Promise((r) => setTimeout(r, 5));   // 模拟 KV 往返
-      this.store.set(k, String(v)); inFlight--;
-    },
-    async delete(k) { this.store.delete(k); },
+// ---- 6. 单条 KV 存储：往返次数与条数无关 ----
+// 历史：逐条存储时订阅下发要 list + 逐条 get（200 条 = 201 次往返，实测 ~1 分钟）；
+// 现在全部代理存单条 blob，读 = 1 次 get，一批上传 = 1 读 + 1 写。
+function countingKv(latencyMs = 0) {
+  const store = new Map();
+  const counts = { get: 0, put: 0, list: 0, delete: 0 };
+  return {
+    store, counts,
+    async get(k) { counts.get++; if (latencyMs) await new Promise((r) => setTimeout(r, latencyMs)); return store.has(k) ? store.get(k) : null; },
+    async put(k, v) { counts.put++; if (latencyMs) await new Promise((r) => setTimeout(r, latencyMs)); store.set(k, String(v)); },
+    async delete(k) { counts.delete++; store.delete(k); },
     async list({ prefix } = {}) {
-      const keys = [...this.store.keys()].filter((k) => k.startsWith(prefix || "")).map((name) => ({ name }));
+      counts.list++;
+      const keys = [...store.keys()].filter((k) => k.startsWith(prefix || "")).map((name) => ({ name }));
       return { keys, list_complete: true };
     },
   };
+}
+
+await t("上传一批 = 1 读 + 1 写（与条数无关）", async () => {
+  const kv = countingKv();
   const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
-  const body = Array.from({ length: 60 }, (_, i) => `1.2.3.${i % 250}:8080:user${i}:pass${i}`).join("\n");
-  const res = await worker.fetch(new Request("https://w.test/api/proxies", {
+  const post = (body) => worker.fetch(new Request("https://w.test/api/proxies", {
     method: "POST", body, headers: { authorization: "Bearer tok" },
   }), localEnv);
+  // 第一次上传：全新 KV 会做一次性旧键迁移探测（list 1 次），写入 blob
+  const body1 = Array.from({ length: 200 }, (_, i) => `1.2.3.${i % 250}:8080:user${i}:pass${i}`).join("\n");
+  const j1 = await (await post(body1)).json();
+  assert.equal(j1.added, 200, "200 条应全部入库");
+  assert.equal(kv.counts.get, 1, `上传只应 1 次读（实测 ${kv.counts.get}）`);
+  assert.equal(kv.counts.put, 1, `上传只应 1 次写（实测 ${kv.counts.put}）`);
+  assert.ok(kv.counts.list <= 1, `首次最多 1 次迁移探测（实测 ${kv.counts.list}）`);
+  // 第二次上传：稳态 —— 不再有任何 list
+  kv.counts.get = kv.counts.put = kv.counts.list = 0;
+  const body2 = Array.from({ length: 200 }, (_, i) => `10.9.${i % 250}.${(i + 7) % 250}:8080`).join("\n");
+  const j2 = await (await post(body2)).json();
+  assert.equal(j2.added, 200);
+  assert.equal(kv.counts.get, 1, `稳态上传只应 1 次读（实测 ${kv.counts.get}）`);
+  assert.equal(kv.counts.put, 1, `稳态上传只应 1 次写（实测 ${kv.counts.put}）`);
+  assert.equal(kv.counts.list, 0, `稳态上传不应触发 list（实测 ${kv.counts.list}）`);
+});
+
+await t("订阅下发 = 1 次读（200 条，不再逐条 get）", async () => {
+  const kv = countingKv(3);   // 每次 3ms 往返，串行 get 会立刻暴露
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const lines = Array.from({ length: 200 }, (_, i) => `10.0.${Math.floor(i / 250) % 250}.${i % 250}:8080`).join("\n");
+  await worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body: lines, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  kv.counts.get = 0;
+  // 建订阅 + 拉取
+  const login = await worker.fetch(new Request("https://w.test/api/login", {
+    method: "POST", body: JSON.stringify({ password: "pw" }),
+  }), localEnv);
+  const cookie = login.headers.get("set-cookie").match(/pc_admin=[^;]+/)[0];
+  const sub = await (await worker.fetch(new Request("https://w.test/api/subs", {
+    method: "POST", body: JSON.stringify({ name: "perf" }), headers: { cookie },
+  }), localEnv)).json();
+  const res = await worker.fetch(new Request(sub.url, { headers: { "user-agent": "curl/8.0" } }), localEnv);
+  assert.equal(res.status, 200);
+  const bodyText = Buffer.from(await res.text(), "base64").toString("utf8");
+  assert.equal(bodyText.split("\n").filter(Boolean).length, 200);
+  // 2 次 = sub:<id> 记录 1 次 + 代理 blob 1 次（旧方案是 1 + 200 次逐条 get）
+  assert.equal(kv.counts.get, 2, `订阅下发应只 2 次 KV get（实测 ${kv.counts.get}）`);
+});
+
+async function adminCookie(worker, env) {
+  const login = await worker.fetch(new Request("https://w.test/api/login", {
+    method: "POST", body: JSON.stringify({ password: env.ADMIN_PASSWORD }),
+  }), env);
+  return login.headers.get("set-cookie").match(/pc_admin=[^;]+/)[0];
+}
+
+await t("旧格式 p:<sha1> 键自动迁移进 blob 并删除", async () => {
+  const kv = countingKv();
+  const crypto = await import("node:crypto");
+  const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex");
+  const legacy = [
+    { raw: "vmess://legacy1", proto: "vmess", host: "1.1.1.1", port: 443, added_at: 111, expires_at: null },
+    { raw: "ss://legacy2", proto: "ss", host: "2.2.2.2", port: 8388, added_at: 222, expires_at: null },
+  ];
+  for (const p of legacy) kv.store.set("p:" + sha1(p.raw), JSON.stringify(p));
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const cookie = await adminCookie(worker, localEnv);
+  const res = await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { cookie },
+  }), localEnv);
   const j = await res.json();
-  assert.equal(j.added, 60, "60 条应全部入库");
-  assert.ok(maxInFlight > 1, `写入应并发（实测最大并发 ${maxInFlight}）`);
-  assert.ok(maxInFlight <= 25, `并发不得超过 PUT_CONCURRENCY（实测 ${maxInFlight}）`);
+  assert.equal(j.count, 2, "旧键数据应迁移可见");
+  assert.ok(kv.store.has("store:proxies"), "应写入新 blob");
+  assert.equal([...kv.store.keys()].filter((k) => k.startsWith("p:")).length, 0, "旧键应被删除");
+});
+
+await t("重复上传续期 + 永久/过期语义不变", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const post = (body, path = "/api/proxies") => worker.fetch(new Request("https://w.test" + path, {
+    method: "POST", body, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  assert.equal((await (await post("1.2.3.4:8080")).json()).added, 1);
+  assert.equal((await (await post("1.2.3.4:8080")).json()).refreshed, 1, "重复上传应续期");
+  // 7 天过期路径 + 过期后从读取中消失（懒清理）
+  await post("5.6.7.8:9999", "/api/proxies/expiring?ttl=1s");
+  await new Promise((r) => setTimeout(r, 1100));
+  const cookie = await adminCookie(worker, localEnv);
+  const list = await (await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { cookie },
+  }), localEnv)).json();
+  const raws = list.proxies.map((p) => p.raw);
+  assert.ok(raws.includes("1.2.3.4:8080"), "永久代理仍在");
+  assert.ok(!raws.includes("5.6.7.8:9999"), "过期代理应被懒清理");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
