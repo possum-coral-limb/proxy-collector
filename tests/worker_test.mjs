@@ -314,7 +314,7 @@ function countingKv(latencyMs = 0) {
   };
 }
 
-await t("上传一批 = 1 读 + 1 写（与条数无关）", async () => {
+await t("上传一批 = 2 读 + 1 写（含写后完整性校验）", async () => {
   const kv = countingKv();
   const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
   const post = (body) => worker.fetch(new Request("https://w.test/api/proxies", {
@@ -324,7 +324,7 @@ await t("上传一批 = 1 读 + 1 写（与条数无关）", async () => {
   const body1 = Array.from({ length: 200 }, (_, i) => `1.2.3.${i % 250}:8080:user${i}:pass${i}`).join("\n");
   const j1 = await (await post(body1)).json();
   assert.equal(j1.added, 200, "200 条应全部入库");
-  assert.equal(kv.counts.get, 1, `上传只应 1 次读（实测 ${kv.counts.get}）`);
+  assert.equal(kv.counts.get, 2, `上传应 2 次读（合并 + 写后校验，实测 ${kv.counts.get}）`);
   assert.equal(kv.counts.put, 1, `上传只应 1 次写（实测 ${kv.counts.put}）`);
   assert.ok(kv.counts.list <= 1, `首次最多 1 次迁移探测（实测 ${kv.counts.list}）`);
   // 第二次上传：稳态 —— 不再有任何 list
@@ -332,9 +332,29 @@ await t("上传一批 = 1 读 + 1 写（与条数无关）", async () => {
   const body2 = Array.from({ length: 200 }, (_, i) => `10.9.${i % 250}.${(i + 7) % 250}:8080`).join("\n");
   const j2 = await (await post(body2)).json();
   assert.equal(j2.added, 200);
-  assert.equal(kv.counts.get, 1, `稳态上传只应 1 次读（实测 ${kv.counts.get}）`);
+  assert.equal(kv.counts.get, 2, `稳态上传应 2 次读（实测 ${kv.counts.get}）`);
   assert.equal(kv.counts.put, 1, `稳态上传只应 1 次写（实测 ${kv.counts.put}）`);
   assert.equal(kv.counts.list, 0, `稳态上传不应触发 list（实测 ${kv.counts.list}）`);
+});
+
+await t("并发上传竞态：写后校验缩小丢失窗口，后续顺序重传自愈", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const post = (body) => worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  const bodyA = Array.from({ length: 100 }, (_, i) => `10.1.0.${i}:1000`).join("\n");
+  const bodyB = Array.from({ length: 100 }, (_, i) => `10.2.0.${i}:2000`).join("\n");
+  // KV 无 CAS，并发读-改-写的覆盖窗口无法在 worker 内彻底消除（写入方应顺序上传）。
+  // 保证的是：哪怕并发批次互相覆盖，之后任何一次顺序重传都能恢复全量。
+  await Promise.all([post(bodyA), post(bodyB)]);
+  await post(bodyA);
+  await post(bodyB);
+  const res = await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  const j = await res.json();
+  assert.equal(j.count, 200, "顺序重传后两条都应完整（自愈）");
 });
 
 await t("订阅下发 = 1 次读（200 条，不再逐条 get）", async () => {
@@ -406,6 +426,23 @@ await t("重复上传续期 + 永久/过期语义不变", async () => {
   const raws = list.proxies.map((p) => p.raw);
   assert.ok(raws.includes("1.2.3.4:8080"), "永久代理仍在");
   assert.ok(!raws.includes("5.6.7.8:9999"), "过期代理应被懒清理");
+});
+
+await t("GET /api/proxies 仅 Bearer UPLOAD_TOKEN（无 admin 会话）可用", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  await worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body: "1.2.3.4:8080", headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  const res = await worker.fetch(new Request("https://w.test/api/proxies", {
+    headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  assert.equal(res.status, 200, "Bearer 拉取全量应放行（外部出口池用途）");
+  const j = await res.json();
+  assert.equal(j.count, 1, "应返回已上传的 1 条");
+  // 无凭据仍应 401
+  const res2 = await worker.fetch(new Request("https://w.test/api/proxies"), localEnv);
+  assert.equal(res2.status, 401, "无凭据应拒绝");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

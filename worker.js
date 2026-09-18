@@ -720,14 +720,18 @@ async function writeStore(kv, store) {
 }
 
 /** 单条记录的合并/续期语义（与旧 putProxy 一致）：重复上传延长过期时间 */
+// 注意：KV 无 CAS，多个写入者并发时读-改-写可能互相覆盖（写后校验只能缩小窗口，
+// 无法根除）。上传方必须顺序分批；单写入者（注册器）路径不受影响，重复上传自愈。
 async function putProxyBatch(kv, recs, expiresAt) {
   let added = 0, refreshed = 0;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const store = await readStore(kv);
     const now = Date.now();
     added = 0; refreshed = 0;
+    const myKeys = new Set();
     for (const rec of recs) {
       const key = await sha1Hex(rec.raw);
+      myKeys.add(key);
       const old = store.entries[key];
       if (old) {
         const newExp = expiresAt ?? (old.expires_at ? Math.max(old.expires_at, now + DEFAULT_TTL_MS) : old.expires_at);
@@ -748,12 +752,20 @@ async function putProxyBatch(kv, recs, expiresAt) {
     }
     try {
       await writeStore(kv, store);
-      return { added, refreshed };
     } catch (e) {
       if (String(e.message || e).includes("超过保护上限")) throw e;
       if (attempt === 3) throw e;
-      // 乐观锁冲突/瞬时错误：重读合并重试
+      // 瞬时错误：重读合并重试
+      continue;
     }
+    // KV 无 CAS：并发写者的读-改-写可能整体覆盖掉本批（丢条目）。
+    // 写后重读校验本批条目齐全，缺失则基于最新快照重合并重试。
+    const verify = await readStore(kv);
+    let missing = false;
+    for (const k of myKeys) {
+      if (!verify.entries[k]) { missing = true; break; }
+    }
+    if (!missing) return { added, refreshed };
   }
   return { added, refreshed };
 }
@@ -1020,10 +1032,18 @@ export default {
     }
 
     if (path.startsWith("/api/")) {
-      const guard = adminAuth(request, env);
-      if (guard) return guard;
-
-      // 读取：admin 会话或 UPLOAD_TOKEN（供外部程序拉取全量做出口池）
+      // GET /api/proxies 额外放行 Bearer UPLOAD_TOKEN（供外部程序拉取全量做出口池）
+      const bearerList =
+        path === "/api/proxies" &&
+        method === "GET" &&
+        env.UPLOAD_TOKEN &&
+        (request.headers.get("authorization") || "")
+          .replace(/^Bearer\s+/i, "")
+          .trim() === env.UPLOAD_TOKEN;
+      if (!bearerList) {
+        const guard = adminAuth(request, env);
+        if (guard) return guard;
+      }
       if (path === "/api/proxies" && method === "GET") {
         const auth = request.headers.get("authorization") || "";
         const token = auth.replace(/^Bearer\s+/i, "").trim();
