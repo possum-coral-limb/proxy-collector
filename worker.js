@@ -40,7 +40,14 @@ function jsonResp(data, status = 200, headers = {}) {
 }
 
 function b64encode(s) {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+  // 分块转换：String.fromCharCode(...bytes) 一次性展开会在 ~10 万字节时栈溢出
+  // （数千条代理的订阅体即可触发），必须按块拼接。
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
 }
 
 function b64decode(s) {

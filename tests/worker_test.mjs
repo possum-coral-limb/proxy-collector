@@ -337,8 +337,7 @@ await t("上传一批 = 2 读 + 1 写（含写后完整性校验）", async () =
   assert.equal(kv.counts.list, 0, `稳态上传不应触发 list（实测 ${kv.counts.list}）`);
 });
 
-await t("并发上传竞态：写后校验缩小丢失窗口，后续顺序重传自愈", async () => {
-  const kv = countingKv();
+await t("并发上传竞态：写后校验缩小丢失窗口，后续顺序重传自愈", async () => {  const kv = countingKv();
   const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
   const post = (body) => worker.fetch(new Request("https://w.test/api/proxies", {
     method: "POST", body, headers: { authorization: "Bearer tok" },
@@ -387,6 +386,27 @@ async function adminCookie(worker, env) {
   }), env);
   return login.headers.get("set-cookie").match(/pc_admin=[^;]+/)[0];
 }
+
+await t("万条订阅 base64 不爆栈（b64encode 分块）", async () => {
+  const kv = countingKv();
+  const localEnv = { PROXY_KV: kv, UPLOAD_TOKEN: "tok", ADMIN_PASSWORD: "pw" };
+  const lines = Array.from({ length: 15000 }, (_, i) =>
+    `10.${Math.floor(i / 65536) % 250}.${Math.floor(i / 256) % 250}.${i % 250}:${1000 + (i % 60000)}`).join("\n");
+  await worker.fetch(new Request("https://w.test/api/proxies", {
+    method: "POST", body: lines, headers: { authorization: "Bearer tok" },
+  }), localEnv);
+  const login = await worker.fetch(new Request("https://w.test/api/login", {
+    method: "POST", body: JSON.stringify({ password: "pw" }),
+  }), localEnv);
+  const cookie = login.headers.get("set-cookie").match(/pc_admin=[^;]+/)[0];
+  const sub = await (await worker.fetch(new Request("https://w.test/api/subs", {
+    method: "POST", body: JSON.stringify({ name: "big" }), headers: { cookie },
+  }), localEnv)).json();
+  const res = await worker.fetch(new Request(sub.url, { headers: { "user-agent": "curl/8.0" } }), localEnv);
+  assert.equal(res.status, 200, "万条订阅应 200（旧 b64encode 会栈溢出 500）");
+  const bodyText = Buffer.from(await res.text(), "base64").toString("utf8");
+  assert.equal(bodyText.split("\n").filter(Boolean).length, 15000, "解码后应为 15000 行");
+});
 
 await t("旧格式 p:<sha1> 键自动迁移进 blob 并删除", async () => {
   const kv = countingKv();
